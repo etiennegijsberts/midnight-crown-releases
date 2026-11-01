@@ -1,0 +1,115 @@
+# Midnight Crown — signs the Windows installer of a GitHub release with Azure Artifact Signing (formerly Trusted Signing)
+# and rewrites latest.json (the Windows app checks the installer's SHA-256 and size from it).
+#
+# Where: the repository midnight-crown-releases, as .github/workflows/sign-release.yml
+# Secrets (Settings → Secrets and variables → Actions): AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#   AZURE_SIGNING_ENDPOINT (the account's "Account URI", e.g. https://neu.codesigning.azure.net for North Europe),
+#   AZURE_SIGNING_ACCOUNT, AZURE_SIGNING_PROFILE
+#
+# Runs: 1) by hand — Actions → Sign release → Run workflow → the release's tag (works on a draft release too: the workflow
+#          signs, replaces the files and publishes the draft);
+#       2) by itself when a release is published (the unsigned installer is public for the few minutes the signing takes).
+# Until the Azure secrets exist the workflow only publishes the draft (a warning says the release is unsigned); once they are
+# set, a signing that fails stops the workflow and leaves a draft unpublished (nothing half-done goes out).
+name: Sign release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v713)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sign-${{ github.event.inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+    steps:
+      - name: Download the installer and latest.json from the release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path work | Out-Null
+          # the release by its tag through the API (a draft has no git tag yet, so the API list is the sure way)
+          $rel = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=50" | ConvertFrom-Json | Where-Object { $_.tag_name -eq $env:TAG } | Select-Object -First 1
+          if (-not $rel) { throw "No release with tag $env:TAG" }
+          Write-Host "Release $($rel.name) (draft: $($rel.draft)), $($rel.assets.Count) assets"
+          foreach ($name in @('MidnightCrown-Setup.exe', 'latest.json')) {
+            $a = $rel.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if (-not $a) { throw "The release has no $name" }
+            gh api -H "Accept: application/octet-stream" "repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" > "work\$name"
+          }
+          Get-ChildItem work | Format-Table Name, Length
+
+      - name: Is signing set up, and is it signed already?
+        id: check
+        shell: pwsh
+        env:
+          ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+        run: |
+          $on = -not [string]::IsNullOrWhiteSpace($env:ACCOUNT)
+          if (-not $on) { Write-Host "::warning::The Azure signing secrets are not set yet: the release is published unsigned" }
+          "enabled=$(if ($on) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+          $s = Get-AuthenticodeSignature work\MidnightCrown-Setup.exe
+          Write-Host "Signature status: $($s.Status) $($s.SignerCertificate.Subject)"
+          "signed=$(if ($s.Status -eq 'Valid') { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
+
+      - name: Sign with Azure Artifact Signing
+        if: steps.check.outputs.enabled == 'true' && steps.check.outputs.signed != 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the signature
+        if: steps.check.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $s = Get-AuthenticodeSignature work\MidnightCrown-Setup.exe
+          Write-Host "Signature status: $($s.Status)"
+          Write-Host "Signer: $($s.SignerCertificate.Subject)"
+          Write-Host "Timestamp: $($s.TimeStamperCertificate.Subject)"
+          if ($s.Status -ne 'Valid') { throw "The installer is not validly signed ($($s.Status))" }
+
+      - name: Rewrite latest.json for the signed installer
+        if: steps.check.outputs.enabled == 'true' && steps.check.outputs.signed != 'true'
+        shell: pwsh
+        run: |
+          $f = Get-Item work\MidnightCrown-Setup.exe
+          $j = Get-Content work\latest.json -Raw | ConvertFrom-Json
+          $j.sha256 = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+          $j.size = $f.Length
+          $j | Add-Member -NotePropertyName signed -NotePropertyValue $true -Force
+          $j | ConvertTo-Json -Compress | Set-Content work\latest.json -NoNewline -Encoding utf8NoBOM
+          Get-Content work\latest.json
+
+      - name: Upload the signed installer and latest.json (replaces the unsigned ones)
+        if: steps.check.outputs.enabled == 'true' && steps.check.outputs.signed != 'true'
+        shell: pwsh
+        run: |
+          gh release upload "$env:TAG" work\MidnightCrown-Setup.exe work\latest.json --clobber --repo "$env:GITHUB_REPOSITORY"
+
+      - name: Publish the release when it is still a draft
+        shell: pwsh
+        run: |
+          $draft = gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --json isDraft --jq .isDraft
+          if ($draft -eq 'true') { gh release edit "$env:TAG" --draft=false --repo "$env:GITHUB_REPOSITORY"; Write-Host "Published $env:TAG" } else { Write-Host "$env:TAG was published already" }
